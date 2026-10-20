@@ -1,0 +1,104 @@
+// HPACK vectors from RFC 7541 Appendix C (via golang.org/x/net hpack_test.go),
+// plus encoder round trips and malformed blocks. Run with `tarn test`.
+import "lib"
+
+fn unhex(text &string) Vec<u8> {
+    var out: Vec<u8> = Vec.new()
+    var high = 0
+    var have = false
+    for byte in text.bytes() {
+        var digit = -1
+        if byte >= 48 && byte <= 57 { digit = i32(byte) - 48 }
+        if byte >= 97 && byte <= 102 { digit = i32(byte) - 87 }
+        if digit >= 0 {
+            if have { out.push(u8(high * 16 + digit))
+                have = false
+            } else { high = digit
+                have = true }
+        }
+    }
+    return out
+}
+fn expect(decoder &mut lib.Decoder, block &string, expected &[]lib.Header, size usize) {
+    match decoder.decode(unhex(block).as_slice(), 65536) {
+        Ok(headers) => {
+            if headers.len() != expected.len() { panic("header count") }
+            var i = usize(0)
+            for i < headers.len() {
+                if headers.get(i).name != expected[i].name || headers.get(i).value != expected[i].value {
+                    print(headers.get(i).name)
+                    print(headers.get(i).value)
+                    panic("header mismatch")
+                }
+                i = i + 1
+            }
+        }
+        Err(error) => {
+            print(error.code)
+            panic("decode failed")
+        }
+    }
+    if decoder.table_size() != size {
+        print(decoder.table_size())
+        panic("table size")
+    }
+}
+fn h(name &string, value &string) lib.Header { return lib.Header.new(name, value) }
+fn rejects(block &string) bool {
+    var decoder = lib.Decoder.new(4096)
+    match decoder.decode(unhex(block).as_slice(), 65536) {
+        Ok(headers) => { return false }
+        Err(error) => { return true }
+    }
+}
+
+fn test_c4_requests_with_huffman() {
+    var d = lib.Decoder.new(4096)
+    expect(&mut d, &"8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff",
+        &[4]lib.Header{h(&":method", &"GET"), h(&":scheme", &"http"), h(&":path", &"/"), h(&":authority", &"www.example.com")}, 57)
+    expect(&mut d, &"8286 84be 5886 a8eb 1064 9cbf",
+        &[5]lib.Header{h(&":method", &"GET"), h(&":scheme", &"http"), h(&":path", &"/"), h(&":authority", &"www.example.com"), h(&"cache-control", &"no-cache")}, 110)
+    expect(&mut d, &"8287 85bf 4088 25a8 49e9 5ba9 7d7f 8925 a849 e95b b8e8 b4bf",
+        &[5]lib.Header{h(&":method", &"GET"), h(&":scheme", &"https"), h(&":path", &"/index.html"), h(&":authority", &"www.example.com"), h(&"custom-key", &"custom-value")}, 164)
+}
+fn test_c6_responses_with_huffman_and_eviction() {
+    var d = lib.Decoder.new(256)
+    expect(&mut d, &"4882 6402 5885 aec3 771a 4b61 96d0 7abe 9410 54d4 44a8 2005 9504 0b81 66e0 82a6 2d1b ff6e 919d 29ad 1718 63c7 8f0b 97c8 e9ae 82ae 43d3",
+        &[4]lib.Header{h(&":status", &"302"), h(&"cache-control", &"private"), h(&"date", &"Mon, 21 Oct 2013 20:13:21 GMT"), h(&"location", &"https://www.example.com")}, 222)
+    expect(&mut d, &"4883 640e ffc1 c0bf",
+        &[4]lib.Header{h(&":status", &"307"), h(&"cache-control", &"private"), h(&"date", &"Mon, 21 Oct 2013 20:13:21 GMT"), h(&"location", &"https://www.example.com")}, 222)
+    expect(&mut d, &"88c1 6196 d07a be94 1054 d444 a820 0595 040b 8166 e084 a62d 1bff c05a 839b d9ab 77ad 94e7 821d d7f2 e6c7 b335 dfdf cd5b 3960 d5af 2708 7f36 72c1 ab27 0fb5 291f 9587 3160 65c0 03ed 4ee5 b106 3d50 07",
+        &[6]lib.Header{h(&":status", &"200"), h(&"cache-control", &"private"), h(&"date", &"Mon, 21 Oct 2013 20:13:22 GMT"), h(&"location", &"https://www.example.com"),
+            h(&"content-encoding", &"gzip"), h(&"set-cookie", &"foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1")}, 215)
+}
+fn test_encoder_round_trips() {
+    headers := [4]lib.Header{h(&":method", &"POST"), h(&":path", &"/telephony.v1.CallTransport/AgentMedia"), h(&"content-type", &"application/grpc"),
+        h(&"x-long", &"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789")}
+    block := lib.encode(&headers)
+    var d = lib.Decoder.new(4096)
+    match d.decode(block.as_slice(), 65536) {
+        Ok(decoded) => {
+            if decoded.len() != 4 || decoded.get(3).value != headers[3].value || decoded.get(1).name != ":path" { panic("round trip") }
+        }
+        Err(error) => { panic("round trip decode") }
+    }
+    if d.table_size() != 0 { panic("literal without indexing must not insert") }
+}
+fn test_malformed_blocks_are_rejected() {
+    if !rejects(&"80") { panic("index zero") }
+    if !rejects(&"be") { panic("empty dynamic index") }
+    if !rejects(&"0085 ffff ffff ff") { panic("huffman EOS") }
+    if !rejects(&"0081 00") { panic("huffman padding not ones") }
+    if !rejects(&"0003 41") { panic("truncated literal") }
+    if !rejects(&"82 3f e1 1f") { panic("size update after field") }
+    if !rejects(&"3fe2 1f") { panic("size update above limit") }
+    if !rejects(&"0001 4101 61") { panic("uppercase field name") }
+    if rejects(&"3fe1 1f 82") { panic("size update to limit") }
+}
+fn test_header_list_limit() {
+    var d = lib.Decoder.new(4096)
+    match d.decode(unhex(&"8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff").as_slice(), 100) {
+        Ok(headers) => { panic("limit not enforced") }
+        Err(error) => {}
+    }
+}

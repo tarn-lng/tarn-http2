@@ -1,0 +1,170 @@
+// Integration client against tests/h2server (Go net/http HTTP/2). Run with
+// tests/run.sh, which starts the server and passes its address.
+import "io"
+import "lib"
+import "net"
+import "os"
+
+fn require(value bool, what &string) { if !value { panic(what.clone()) } }
+fn ok<T>(result Result<T, lib.Error>) T {
+    match result { Ok(value) => { return value }
+        Err(error) => {
+            print(error.code)
+            panic("HTTP/2 error")
+        } }
+}
+fn request(c &mut lib.Connection, method &string, path &string, authority &string, end bool) u32 {
+    headers := [5]lib.Header{lib.Header.new(&":method", method), lib.Header.new(&":scheme", &"http"), lib.Header.new(&":path", path),
+        lib.Header.new(&":authority", authority), lib.Header.new(&"x-client", &"tarn")}
+    return ok(c.open(&headers, end))
+}
+fn field(headers &[]lib.Header, name &string) string {
+    for header in headers { if &header.name == name { return header.value.clone() } }
+    return ""
+}
+fn pattern(count usize, start usize) Vec<u8> {
+    var out: Vec<u8> = Vec.with_capacity(count)
+    for out.len() < count { out.push(u8((start + out.len()) % 251)) }
+    return out
+}
+// Reads a whole response: returns headers; body bytes are checked by `check`.
+fn response(c &mut lib.Connection, expected_status &string) Vec<lib.Header> {
+    var headers: Vec<lib.Header> = Vec.new()
+    for {
+        match ok(c.receive()) {
+            lib.Event.Headers(list, end) => {
+                if headers.len() == 0 {
+                    require(&field(list.as_slice(), &":status") == expected_status, &"status")
+                    headers = list
+                }
+                if end { return headers }
+            }
+            lib.Event.Data(bytes, end) => { if end { return headers } }
+            lib.Event.Reset(code) => { panic("unexpected reset") }
+        }
+    }
+}
+
+fn headers_twice(c &mut lib.Connection, authority &string) {
+    // The second response reuses the shared HPACK dynamic table.
+    var round = 0
+    for round < 2 {
+        request(c, &"GET", &"/headers", authority, true)
+        headers := response(c, &"200")
+        require(field(headers.as_slice(), &"x-field-39").len() == 59, &"x-field-39")
+        require(field(headers.as_slice(), &"x-field-00").len() == 20, &"x-field-00")
+        require(c.current() == 0, &"stream closed after response")
+        round = round + 1
+    }
+}
+// 3 MiB download: needs repeated WINDOW_UPDATE credit from the client.
+fn download(c &mut lib.Connection, authority &string) {
+    total := usize(3145728)
+    request(c, &"GET", &"/large?n=3145728", authority, true)
+    var received = usize(0)
+    var done = false
+    for !done {
+        match ok(c.receive()) {
+            lib.Event.Headers(list, end) => { done = end }
+            lib.Event.Data(bytes, end) => {
+                var i = usize(0)
+                for i < bytes.len() {
+                    require(bytes.get(i) == &u8((received + i) % 251), &"download byte")
+                    i = i + 1
+                }
+                received = received + bytes.len()
+                done = end
+            }
+            lib.Event.Reset(code) => { panic("download reset") }
+        }
+    }
+    require(received == total, &"download size")
+}
+// 3 MiB upload in one send: written as the server grants window credit.
+fn upload(c &mut lib.Connection, authority &string) {
+    request(c, &"POST", &"/count", authority, false)
+    ok(c.send(pattern(3145728, 0).as_slice(), true))
+    headers := response(c, &"204")
+    require(field(headers.as_slice(), &"x-count") == "3145728", &"upload count")
+}
+fn reset(c &mut lib.Connection, authority &string) {
+    request(c, &"GET", &"/reset", authority, true)
+    var seen = false
+    for !seen {
+        match ok(c.receive()) {
+            lib.Event.Reset(code) => { seen = true }
+            lib.Event.Headers(list, end) => { require(!end, &"reset arrived as end") }
+            lib.Event.Data(bytes, end) => { require(!end, &"reset arrived as end") }
+        }
+    }
+    require(c.current() == 0, &"reset closes stream")
+}
+// Nonblocking full duplex: 1 MiB echoed while still sending, then trailers.
+fn duplex(address &string, authority &string) Result<void, io.Error> {
+    var c = ok(lib.connect(address, &lib.Options.new()))
+    request(&mut c, &"POST", &"/echo", authority, false)
+    ok(c.set_nonblocking(true))
+    var poll = try net.Poll.new()
+    token := try poll.register_stream(c.stream(), net.Interest.ReadableWritable)
+    var events = [4]net.Event{net.Event.empty(), net.Event.empty(), net.Event.empty(), net.Event.empty()}
+    total := usize(1048576)
+    var sent = usize(0)
+    var received = usize(0)
+    var trailer = ""
+    var finished = false
+    for !finished {
+        if sent < total && c.unsent() < 65536 {
+            var end = false
+            if sent + 16384 == total { end = true }
+            match c.send(pattern(16384, sent).as_slice(), end) {
+                Ok(value) => { sent = sent + 16384 }
+                Err(error) => { if !error.would_block() { panic("duplex send") } }
+            }
+        }
+        var progressed = true
+        for progressed && !finished {
+            match c.receive() {
+                Ok(event) => match event {
+                    lib.Event.Headers(list, end) => {
+                        if end { trailer = field(list.as_slice(), &"x-total")
+                            finished = true }
+                    }
+                    lib.Event.Data(bytes, end) => {
+                        var i = usize(0)
+                        for i < bytes.len() {
+                            require(bytes.get(i) == &u8((received + i) % 251), &"echo byte")
+                            i = i + 1
+                        }
+                        received = received + bytes.len()
+                        finished = end
+                    }
+                    lib.Event.Reset(code) => { panic("duplex reset") }
+                }
+                Err(error) => {
+                    if !error.would_block() { panic("duplex receive") }
+                    progressed = false
+                }
+            }
+        }
+        if !finished { require(try poll.wait(&mut events, 5000) > usize(0), &"duplex stalled") }
+    }
+    require(received == total, &"echo size")
+    require(trailer == "1048576", &"trailer")
+    try poll.deregister_stream(c.stream(), token)
+    return Ok(())
+}
+fn main() Result<void, io.Error> {
+    var args: Vec<string> = Vec.new()
+    match os.args() { Ok(value) => { args = value }
+        Err(error) => { panic("arguments") } }
+    require(args.len() == 2, &"usage: integration ADDRESS")
+    address := args.get(1)
+    var c = ok(lib.connect(address, &lib.Options.new()))
+    headers_twice(&mut c, address)
+    download(&mut c, address)
+    upload(&mut c, address)
+    reset(&mut c, address)
+    try duplex(address, address)
+    print("HTTP/2 integration passed")
+    return Ok(())
+}

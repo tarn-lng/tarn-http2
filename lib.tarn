@@ -1,0 +1,697 @@
+// tarn-http2: HTTP/2 client connections (RFC 9113) with HPACK (RFC 7541),
+// written in pure Tarn over net.TcpStream. h2c with prior knowledge only:
+// the network must be trusted (TLS needs ALPN, which TlsStream lacks).
+// Every partial state lives in the Connection, so one implementation serves
+// blocking use and nonblocking Poll-driven duplex use.
+import "hpack_tables"
+import "io"
+import "net"
+import "string"
+
+pub copy enum ErrorKind {
+    Io
+    InvalidInput
+    /// The peer violated HTTP/2; `code` is the RFC 9113 error code sent.
+    Protocol
+    Compression
+    FlowControl
+    FrameSize
+    /// The peer reset the open stream or refused it with GOAWAY.
+    Refused
+    /// A send would exceed the bounded output queue.
+    TooLarge
+    /// No stream is open, or it is already closed in that direction.
+    StreamClosed
+    /// The connection failed earlier or received GOAWAY.
+    Closed
+}
+pub copy struct Error {
+    pub kind ErrorKind
+    pub code u32
+    pub io io.Error
+}
+fn _error(kind ErrorKind, code u32) Error { return Error{kind: kind, code: code, io: io.Error.new(io.ErrorKind.OtherOs)} }
+fn _io(error io.Error) Error { return Error{kind: ErrorKind.Io, code: 0, io: error} }
+fn _blocked(error io.Error) bool {
+    match error.kind { io.ErrorKind.WouldBlock => { return true }
+        _ => { return false } }
+}
+pub fn Error.would_block(&self) bool {
+    match self.kind { ErrorKind.Io => { return _blocked(self.io) }
+        _ => { return false } }
+}
+
+pub struct Header {
+    pub name string
+    pub value string
+}
+pub fn Header.new(name &string, value &string) Header { return Header{name: name.clone(), value: value.clone()} }
+pub fn Header.clone(&self) Header { return Header{name: self.name.clone(), value: self.value.clone()} }
+
+// ---------------------------------------------------------------- HPACK
+
+fn _entry_size(header &Header) usize { return header.name.len() + header.value.len() + 32 }
+// Prefix-N integer, RFC 7541 section 5.1. Values are bounded well below
+// overflow; nothing legitimate needs more than 2^24.
+fn _hpack_int(block &[]u8, cursor &mut usize, prefix u32) Result<usize, Error> {
+    if *cursor >= block.len() { return Err(_error(ErrorKind.Compression, 9)) }
+    mask := u8((u32(1) << prefix) - 1)
+    var value = usize(block[*cursor] & mask)
+    *cursor = *cursor + 1
+    if value < usize(mask) { return Ok(value) }
+    var shift = usize(0)
+    for {
+        if *cursor >= block.len() || shift > 21 { return Err(_error(ErrorKind.Compression, 9)) }
+        byte := block[*cursor]
+        *cursor = *cursor + 1
+        value = value + (usize(byte & 127) << shift)
+        if byte < 128 { return Ok(value) }
+        shift = shift + 7
+    }
+}
+fn _huffman(data &[]u8) Result<Vec<u8>, Error> {
+    symbols := hpack_tables.huffman_symbols()
+    first := hpack_tables.huffman_first()
+    count := hpack_tables.huffman_count()
+    offset := hpack_tables.huffman_offset()
+    var out: Vec<u8> = Vec.with_capacity(data.len() * 2)
+    var code = u32(0)
+    var length = usize(0)
+    var ones = true
+    for byte in data {
+        var bit = 7
+        for bit >= 0 {
+            set := ((byte >> u8(bit)) & 1) == 1
+            code = (code << 1) | u32(byte >> u8(bit) & 1)
+            length = length + 1
+            ones = ones && set
+            if length > 30 { return Err(_error(ErrorKind.Compression, 9)) }
+            if code >= first[length] && code - first[length] < count[length] {
+                out.push(symbols[usize(offset[length] + code - first[length])])
+                code = 0
+                length = 0
+                ones = true
+            }
+            bit = bit - 1
+        }
+    }
+    // Padding: fewer than 8 bits, all ones (an EOS prefix).
+    if length >= 8 || !ones { return Err(_error(ErrorKind.Compression, 9)) }
+    return Ok(out)
+}
+fn _hpack_string(block &[]u8, cursor &mut usize) Result<string, Error> {
+    if *cursor >= block.len() { return Err(_error(ErrorKind.Compression, 9)) }
+    huffman := block[*cursor] >= 128
+    length := try _hpack_int(block, cursor, 7)
+    if length > block.len() - *cursor { return Err(_error(ErrorKind.Compression, 9)) }
+    begin := *cursor
+    raw := &block[begin..begin + length]
+    *cursor = begin + length
+    var bytes: Vec<u8> = Vec.new()
+    if huffman { bytes = try _huffman(raw) } else { bytes.extend_from_slice(raw) }
+    match string.from_utf8(bytes.as_slice()) { Some(text) => { return Ok(text) }
+        None => { return Err(_error(ErrorKind.Compression, 9)) } }
+}
+
+/// HPACK decoding context: the dynamic table, newest entry last.
+pub struct Decoder {
+    table Vec<Header>
+    size usize
+    max usize
+    limit usize
+}
+/// `limit` is the SETTINGS_HEADER_TABLE_SIZE this endpoint advertised.
+pub fn Decoder.new(limit usize) Decoder { return Decoder{table: Vec.new(), size: 0, max: limit, limit: limit} }
+pub fn Decoder.table_size(&self) usize { return self.size }
+fn Decoder._evict(&mut self, room usize) {
+    if self.size + room <= self.max { return }
+    var drop = usize(0)
+    var size = self.size
+    for drop < self.table.len() && size + room > self.max {
+        size = size - _entry_size(self.table.get(drop))
+        drop = drop + 1
+    }
+    var kept: Vec<Header> = Vec.with_capacity(self.table.len() - drop)
+    var i = drop
+    for i < self.table.len() {
+        kept.push(self.table.get(i).clone())
+        i = i + 1
+    }
+    self.table = kept
+    self.size = size
+}
+fn Decoder._insert(&mut self, header Header) {
+    room := _entry_size(&header)
+    if room > self.max {
+        // RFC 7541 section 4.4: an oversized entry empties the table.
+        self.table = Vec.new()
+        self.size = 0
+        return
+    }
+    self._evict(room)
+    self.size = self.size + room
+    self.table.push(header)
+}
+fn Decoder._lookup(&self, index usize) Result<Header, Error> {
+    if index == 0 { return Err(_error(ErrorKind.Compression, 9)) }
+    if index <= 61 { return Ok(Header{name: hpack_tables.static_name(index), value: hpack_tables.static_value(index)}) }
+    dynamic := index - 62
+    if dynamic >= self.table.len() { return Err(_error(ErrorKind.Compression, 9)) }
+    return Ok(self.table.get(self.table.len() - 1 - dynamic).clone())
+}
+/// Decodes one complete header block. `list_limit` bounds the decoded list
+/// size (name + value + 32 per field).
+pub fn Decoder.decode(&mut self, block &[]u8, list_limit usize) Result<Vec<Header>, Error> {
+    var headers: Vec<Header> = Vec.new()
+    var cursor = usize(0)
+    var total = usize(0)
+    var leading = true
+    for cursor < block.len() {
+        byte := block[cursor]
+        if byte >= 128 {
+            headers.push(try self._lookup(try _hpack_int(block, &mut cursor, 7)))
+            leading = false
+        } else if byte >= 64 || byte < 32 {
+            var prefix = u32(4)
+            if byte >= 64 { prefix = 6 }
+            index := try _hpack_int(block, &mut cursor, prefix)
+            var name = ""
+            if index == 0 { name = try _hpack_string(block, &mut cursor) } else { name = (try self._lookup(index)).name }
+            value := try _hpack_string(block, &mut cursor)
+            header := Header{name: name, value: value}
+            if byte >= 64 { self._insert(header.clone()) }
+            headers.push(header)
+            leading = false
+        } else {
+            // Dynamic table size update: only before the first field.
+            if !leading { return Err(_error(ErrorKind.Compression, 9)) }
+            size := try _hpack_int(block, &mut cursor, 5)
+            if size > self.limit { return Err(_error(ErrorKind.Compression, 9)) }
+            self.max = size
+            self._evict(0)
+        }
+        if headers.len() > 0 {
+            last := headers.get(headers.len() - 1)
+            total = total + _entry_size(last)
+            if total > list_limit { return Err(_error(ErrorKind.TooLarge, 11)) }
+            for b in last.name.bytes() {
+                // Field names are lowercase in HTTP/2.
+                if b >= 65 && b <= 90 { return Err(_error(ErrorKind.Protocol, 1)) }
+            }
+        }
+    }
+    return Ok(headers)
+}
+fn _encode_int(out &mut Vec<u8>, first u8, prefix u32, value usize) {
+    limit := usize((u32(1) << prefix) - 1)
+    if value < limit {
+        out.push(first | u8(value))
+        return
+    }
+    out.push(first | u8(limit))
+    var rest = value - limit
+    for rest >= 128 {
+        out.push(u8(rest & 127) | 128)
+        rest = rest >> 7
+    }
+    out.push(u8(rest))
+}
+/// Literal-without-indexing, non-Huffman fields: valid for every decoder and
+/// stateless, so no encoder table needs to track the peer's settings.
+pub fn encode(headers &[]Header) Vec<u8> {
+    var out: Vec<u8> = Vec.new()
+    for header in headers {
+        out.push(0)
+        _encode_int(&mut out, 0, 7, header.name.len())
+        out.extend_from_slice(header.name.bytes())
+        _encode_int(&mut out, 0, 7, header.value.len())
+        out.extend_from_slice(header.value.bytes())
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- frames
+
+pub enum Event {
+    /// Response headers or trailers; true when they end the stream.
+    Headers(Vec<Header>, bool)
+    /// DATA payload (padding removed); true when it ends the stream.
+    Data(Vec<u8>, bool)
+    /// The peer reset the stream with this error code.
+    Reset(u32)
+}
+
+pub struct Options {
+    /// Bound on queued encoded output, frames and pending DATA included.
+    pub send_limit usize
+    /// Bound on a decoded header list (and its compressed block).
+    pub header_limit usize
+}
+pub fn Options.new() Options { return Options{send_limit: 4194304, header_limit: 65536} }
+
+// Receive window advertised per stream and for the connection.
+fn _window() u32 { return 1048576 }
+
+pub struct Connection {
+    transport net.TcpStream
+    input Vec<u8>
+    start usize
+    output Vec<u8>
+    sent usize
+    decoder Decoder
+    peer_frame usize
+    peer_window i64
+    peer_streams u32
+    conn_window i64
+    stream_window i64
+    active u32
+    next_id u32
+    local_closed bool
+    remote_closed bool
+    queued Vec<u8>
+    pending_start usize
+    pending_end bool
+    end_sent bool
+    block Vec<u8>
+    block_stream u32
+    block_end bool
+    in_block bool
+    goaway bool
+    goaway_last u32
+    failed bool
+    send_limit usize
+    header_limit usize
+    events Vec<Event>
+}
+
+fn _frame_header(out &mut Vec<u8>, length usize, kind u8, flags u8, stream u32) {
+    out.push(u8(length >> 16))
+    out.push(u8((length >> 8) & 255))
+    out.push(u8(length & 255))
+    out.push(kind)
+    out.push(flags)
+    _u32(out, stream)
+}
+fn _u32(out &mut Vec<u8>, value u32) {
+    out.push(u8(value >> 24))
+    out.push(u8((value >> 16) & 255))
+    out.push(u8((value >> 8) & 255))
+    out.push(u8(value & 255))
+}
+fn _read_u32(data &[]u8, at usize) u32 {
+    return (u32(data[at]) << 24) | (u32(data[at + 1]) << 16) | (u32(data[at + 2]) << 8) | u32(data[at + 3])
+}
+
+/// Opens TCP to `host:port`, sends the client preface and settings. Blocks the
+/// current native task; the connection starts in blocking mode.
+pub fn connect(address &string, options &Options) Result<Connection, Error> {
+    if options.send_limit < 65536 || options.header_limit < 4096 || options.header_limit > 16777216 { return Err(_error(ErrorKind.InvalidInput, 0)) }
+    transport := try _lift(net.TcpStream.connect(address))
+    return Connection._start(transport, options)
+}
+fn _lift<T>(result Result<T, io.Error>) Result<T, Error> {
+    match result { Ok(value) => { return Ok(value) }
+        Err(error) => { return Err(_io(error)) } }
+}
+/// Starts HTTP/2 on an already connected stream (for example from a Poll
+/// driven nonblocking connect). The stream must be in blocking mode.
+pub fn Connection.from_stream(transport net.TcpStream, options &Options) Result<Connection, Error> { return Connection._start(transport, options) }
+fn Connection._start(transport net.TcpStream, options &Options) Result<Connection, Error> {
+    var c = Connection{transport: transport, input: Vec.new(), start: 0, output: Vec.new(), sent: 0, decoder: Decoder.new(4096),
+        peer_frame: 16384, peer_window: 65535, peer_streams: 4294967295, conn_window: 65535, stream_window: 0, active: 0, next_id: 1,
+        local_closed: true, remote_closed: true, queued: Vec.new(), pending_start: 0, pending_end: false, end_sent: true,
+        block: Vec.new(), block_stream: 0, block_end: false, in_block: false, goaway: false, goaway_last: 0, failed: false,
+        send_limit: options.send_limit, header_limit: options.header_limit, events: Vec.new()}
+    c.output.extend_from_slice("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".bytes())
+    // ENABLE_PUSH = 0, INITIAL_WINDOW_SIZE, MAX_HEADER_LIST_SIZE.
+    _frame_header(&mut c.output, 18, 4, 0, 0)
+    c.output.push(0)
+    c.output.push(2)
+    _u32(&mut c.output, 0)
+    c.output.push(0)
+    c.output.push(4)
+    _u32(&mut c.output, _window())
+    c.output.push(0)
+    c.output.push(6)
+    _u32(&mut c.output, u32(options.header_limit))
+    _frame_header(&mut c.output, 4, 8, 0, 0)
+    _u32(&mut c.output, _window() - 65535)
+    try c.flush()
+    return Ok(c)
+}
+
+/// The TCP stream, borrowed for readiness registration only.
+pub fn Connection.stream(&self) &net.TcpStream { return &self.transport }
+pub fn Connection.set_nonblocking(&mut self, enabled bool) Result<void, Error> { return _lift(self.transport.set_nonblocking(enabled)) }
+/// Encoded bytes queued and not yet written (pending DATA excluded).
+pub fn Connection.pending(&self) usize { return self.output.len() - self.sent }
+/// DATA bytes accepted by `send` but still waiting for flow-control credit.
+pub fn Connection.unsent(&self) usize { return self.queued.len() - self.pending_start }
+/// The id of the open stream, or zero.
+pub fn Connection.current(&self) u32 { return self.active }
+
+pub fn Connection.flush(&mut self) Result<bool, Error> {
+    if self.failed { return Err(_error(ErrorKind.Closed, 0)) }
+    for self.sent < self.output.len() {
+        match self.transport.write(&self.output.as_slice()[self.sent..]) {
+            Ok(count) => {
+                if count == 0 { self.failed = true
+                    return Err(_io(io.Error.new(io.ErrorKind.WriteZero))) }
+                self.sent = self.sent + count
+            }
+            Err(error) => {
+                if _blocked(error) { return Ok(false) }
+                self.failed = true
+                return Err(_io(error))
+            }
+        }
+    }
+    self.output = Vec.new()
+    self.sent = 0
+    return Ok(true)
+}
+fn Connection._room(&self, extra usize) bool { return self.pending() + self.unsent() + extra <= self.send_limit }
+
+/// Opens a new stream with a request header block. At most one stream is
+/// open at a time; the previous one must be closed in both directions.
+pub fn Connection.open(&mut self, headers &[]Header, end_stream bool) Result<u32, Error> {
+    if self.failed || self.goaway { return Err(_error(ErrorKind.Closed, 0)) }
+    if self.active != 0 { return Err(_error(ErrorKind.InvalidInput, 0)) }
+    if self.next_id > 2147483647 || self.peer_streams == 0 { return Err(_error(ErrorKind.Refused, 7)) }
+    block := encode(headers)
+    if block.len() > self.header_limit || !self._room(block.len() + 64) { return Err(_error(ErrorKind.TooLarge, 0)) }
+    id := self.next_id
+    self.next_id = self.next_id + 2
+    var offset = usize(0)
+    var first = true
+    for first || offset < block.len() {
+        var size = block.len() - offset
+        if size > self.peer_frame { size = self.peer_frame }
+        var flags = u8(0)
+        if offset + size == block.len() { flags = 4 }
+        if first {
+            if end_stream { flags = flags | 1 }
+            _frame_header(&mut self.output, size, 1, flags, id)
+        } else {
+            _frame_header(&mut self.output, size, 9, flags, id)
+        }
+        self.output.extend_from_slice(&block.as_slice()[offset..offset + size])
+        offset = offset + size
+        first = false
+    }
+    self.active = id
+    self.stream_window = self.peer_window
+    self.local_closed = end_stream
+    self.end_sent = end_stream
+    self.remote_closed = false
+    self.queued = Vec.new()
+    self.pending_start = 0
+    self.pending_end = end_stream
+    try self.flush()
+    return Ok(id)
+}
+/// Queues DATA on the open stream; it is written as flow-control credit
+/// allows. `end_stream` half-closes the stream after this data.
+pub fn Connection.send(&mut self, data &[]u8, end_stream bool) Result<void, Error> {
+    if self.failed { return Err(_error(ErrorKind.Closed, 0)) }
+    if self.active == 0 || self.local_closed { return Err(_error(ErrorKind.StreamClosed, 0)) }
+    if !self._room(data.len() + 9) { return Err(_error(ErrorKind.TooLarge, 0)) }
+    if self.pending_start == self.queued.len() {
+        self.queued = Vec.new()
+        self.pending_start = 0
+    }
+    self.queued.extend_from_slice(data)
+    self.pending_end = end_stream
+    self.local_closed = end_stream
+    self._pump()
+    try self.flush()
+    return Ok(())
+}
+/// Cancels the open stream (RST_STREAM) and drops its pending DATA.
+pub fn Connection.reset(&mut self, code u32) Result<void, Error> {
+    if self.active == 0 { return Err(_error(ErrorKind.StreamClosed, 0)) }
+    _frame_header(&mut self.output, 4, 3, 0, self.active)
+    _u32(&mut self.output, code)
+    self._close_stream()
+    try self.flush()
+    return Ok(())
+}
+fn Connection._close_stream(&mut self) {
+    self.active = 0
+    self.local_closed = true
+    self.remote_closed = true
+    self.queued = Vec.new()
+    self.pending_start = 0
+    self.end_sent = true
+}
+fn Connection._finish_if_closed(&mut self) {
+    if self.active != 0 && self.remote_closed && self.end_sent { self._close_stream() }
+}
+fn Connection._pump(&mut self) {
+    if self.active == 0 { return }
+    for self.pending_start < self.queued.len() {
+        var size = self.queued.len() - self.pending_start
+        if size > self.peer_frame { size = self.peer_frame }
+        if i64(size) > self.conn_window { size = usize(self.conn_window) }
+        if i64(size) > self.stream_window { size = usize(self.stream_window) }
+        if size == 0 { return }
+        last := self.pending_start + size == self.queued.len()
+        var flags = u8(0)
+        if last && self.pending_end { flags = 1 }
+        _frame_header(&mut self.output, size, 0, flags, self.active)
+        self.output.extend_from_slice(&self.queued.as_slice()[self.pending_start..self.pending_start + size])
+        self.pending_start = self.pending_start + size
+        self.conn_window = self.conn_window - i64(size)
+        self.stream_window = self.stream_window - i64(size)
+        if last && self.pending_end { self.end_sent = true }
+    }
+    if self.pending_end && !self.end_sent {
+        // An empty DATA frame needs no flow-control credit.
+        _frame_header(&mut self.output, 0, 0, 1, self.active)
+        self.end_sent = true
+    }
+    self._finish_if_closed()
+}
+fn Connection._fail(&mut self, kind ErrorKind, code u32) Error {
+    if !self.failed {
+        _frame_header(&mut self.output, 8, 7, 0, 0)
+        _u32(&mut self.output, self.next_id - 2)
+        _u32(&mut self.output, code)
+        match self.flush() { Ok(value) => {}
+            Err(error) => {} }
+    }
+    self.failed = true
+    return _error(kind, code)
+}
+
+/// Next event of the open stream. Connection frames (SETTINGS, PING, window
+/// updates, GOAWAY) are handled internally. A nonblocking connection returns
+/// a WouldBlock error (`would_block`) when no event is complete.
+pub fn Connection.receive(&mut self) Result<Event, Error> {
+    if self.failed { return Err(_error(ErrorKind.Closed, 0)) }
+    var chunk: Vec<u8> = Vec.new()
+    for {
+        if self.events.len() > 0 {
+            // Events are queued only one at a time, so this pops the oldest.
+            match self.events.pop() { Some(event) => { return Ok(event) }
+                None => {} }
+        }
+        self._pump()
+        try self.flush()
+        available := self.input.len() - self.start
+        if available >= 9 {
+            at := self.start
+            length := (usize(self.input.at(at)) << 16) | (usize(self.input.at(at + 1)) << 8) | usize(self.input.at(at + 2))
+            if length > 16384 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+            if available >= 9 + length {
+                kind := self.input.at(at + 3)
+                flags := self.input.at(at + 4)
+                id := _read_u32(self.input.as_slice(), at + 5) & 2147483647
+                var payload: Vec<u8> = Vec.with_capacity(length)
+                payload.extend_from_slice(&self.input.as_slice()[at + 9..at + 9 + length])
+                self.start = at + 9 + length
+                try self._frame(kind, flags, id, payload)
+                continue
+            }
+        }
+        if self.start > 0 && self.start * 2 >= self.input.len() {
+            var rest: Vec<u8> = Vec.with_capacity(self.input.len() - self.start + 16384)
+            rest.extend_from_slice(&self.input.as_slice()[self.start..])
+            self.input = rest
+            self.start = 0
+        }
+        if chunk.len() == 0 { for chunk.len() < 16384 { chunk.push(0) } }
+        match self.transport.read(chunk.as_mut_slice()) {
+            Ok(count) => {
+                if count == 0 { self.failed = true
+                    return Err(_io(io.Error.new(io.ErrorKind.UnexpectedEof))) }
+                self.input.extend_from_slice(&chunk.as_slice()[..count])
+            }
+            Err(error) => {
+                if !_blocked(error) { self.failed = true }
+                return Err(_io(error))
+            }
+        }
+    }
+}
+// Strips padding (PADDED flag) and, for HEADERS, the priority fields.
+fn _unpad(payload &[]u8, flags u8, priority bool) Option<Vec<u8>> {
+    var begin = usize(0)
+    var end = payload.len()
+    if (flags & 8) != 0 {
+        if end == 0 { return None }
+        pad := usize(payload[0])
+        begin = 1
+        if pad > end - begin { return None }
+        end = end - pad
+    }
+    if priority {
+        if end - begin < 5 { return None }
+        begin = begin + 5
+    }
+    var out: Vec<u8> = Vec.with_capacity(end - begin)
+    out.extend_from_slice(&payload[begin..end])
+    return Some(out)
+}
+fn Connection._frame(&mut self, kind u8, flags u8, id u32, payload Vec<u8>) Result<void, Error> {
+    if self.in_block && (kind != 9 || id != self.block_stream) { return Err(self._fail(ErrorKind.Protocol, 1)) }
+    if kind == 0 {
+        if id == 0 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        // Credit the whole frame back at once: the payload leaves our buffers
+        // as soon as the caller receives it.
+        if payload.len() > 0 {
+            _frame_header(&mut self.output, 4, 8, 0, 0)
+            _u32(&mut self.output, u32(payload.len()))
+        }
+        if id != self.active || self.remote_closed {
+            if id >= self.next_id { return Err(self._fail(ErrorKind.Protocol, 1)) }
+            return Ok(())
+        }
+        end := (flags & 1) != 0
+        if payload.len() > 0 && !end {
+            _frame_header(&mut self.output, 4, 8, 0, id)
+            _u32(&mut self.output, u32(payload.len()))
+        }
+        match _unpad(payload.as_slice(), flags, false) {
+            Some(bytes) => { self.events.push(Event.Data(bytes, end)) }
+            None => { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        }
+        if end { self.remote_closed = true }
+        self._finish_if_closed()
+        return Ok(())
+    }
+    if kind == 1 {
+        if id == 0 || id >= self.next_id { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        fragment := _unpad(payload.as_slice(), flags, (flags & 32) != 0)
+        match fragment {
+            Some(bytes) => { self.block = bytes }
+            None => { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        }
+        self.block_stream = id
+        self.block_end = (flags & 1) != 0
+        self.in_block = true
+        if (flags & 4) != 0 { return self._headers_done() }
+        return Ok(())
+    }
+    if kind == 9 {
+        if !self.in_block { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        if self.block.len() + payload.len() > self.header_limit { return Err(self._fail(ErrorKind.TooLarge, 11)) }
+        self.block.extend_from_slice(payload.as_slice())
+        if (flags & 4) != 0 { return self._headers_done() }
+        return Ok(())
+    }
+    if kind == 2 {
+        if payload.len() != 5 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+        return Ok(())
+    }
+    if kind == 3 {
+        if id == 0 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        if payload.len() != 4 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+        if id == self.active {
+            self._close_stream()
+            self.events.push(Event.Reset(_read_u32(payload.as_slice(), 0)))
+        }
+        return Ok(())
+    }
+    if kind == 4 {
+        if id != 0 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        if (flags & 1) != 0 {
+            if payload.len() != 0 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+            return Ok(())
+        }
+        if payload.len() % 6 != 0 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+        var at = usize(0)
+        for at < payload.len() {
+            setting := (u32(payload.at(at)) << 8) | u32(payload.at(at + 1))
+            value := _read_u32(payload.as_slice(), at + 2)
+            if setting == 2 && value > 1 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+            if setting == 3 { self.peer_streams = value }
+            if setting == 4 {
+                if value > 2147483647 { return Err(self._fail(ErrorKind.FlowControl, 3)) }
+                // The change applies to the open stream's window too.
+                self.stream_window = self.stream_window + i64(value) - self.peer_window
+                self.peer_window = i64(value)
+            }
+            if setting == 5 {
+                if value < 16384 || value > 16777215 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+                self.peer_frame = usize(value)
+            }
+            at = at + 6
+        }
+        _frame_header(&mut self.output, 0, 4, 1, 0)
+        return Ok(())
+    }
+    if kind == 5 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+    if kind == 6 {
+        if id != 0 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        if payload.len() != 8 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+        if (flags & 1) == 0 {
+            _frame_header(&mut self.output, 8, 6, 1, 0)
+            self.output.extend_from_slice(payload.as_slice())
+        }
+        return Ok(())
+    }
+    if kind == 7 {
+        if id != 0 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        if payload.len() < 8 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+        self.goaway = true
+        self.goaway_last = _read_u32(payload.as_slice(), 0) & 2147483647
+        if self.active != 0 && self.active > self.goaway_last {
+            self._close_stream()
+            return Err(_error(ErrorKind.Refused, _read_u32(payload.as_slice(), 4)))
+        }
+        return Ok(())
+    }
+    if kind == 8 {
+        if payload.len() != 4 { return Err(self._fail(ErrorKind.FrameSize, 6)) }
+        increment := i64(_read_u32(payload.as_slice(), 0) & 2147483647)
+        if increment == 0 { return Err(self._fail(ErrorKind.Protocol, 1)) }
+        if id == 0 {
+            self.conn_window = self.conn_window + increment
+            if self.conn_window > 2147483647 { return Err(self._fail(ErrorKind.FlowControl, 3)) }
+        } else if id == self.active {
+            self.stream_window = self.stream_window + increment
+            if self.stream_window > 2147483647 { return Err(self._fail(ErrorKind.FlowControl, 3)) }
+        }
+        return Ok(())
+    }
+    // Unknown frame types are ignored (RFC 9113 section 4.1).
+    return Ok(())
+}
+fn Connection._headers_done(&mut self) Result<void, Error> {
+    self.in_block = false
+    var block: Vec<u8> = Vec.with_capacity(self.block.len())
+    block.extend_from_slice(self.block.as_slice())
+    self.block = Vec.new()
+    // Decoding must run even for a stale stream: it updates the shared table.
+    var headers: Vec<Header> = Vec.new()
+    match self.decoder.decode(block.as_slice(), self.header_limit) {
+        Ok(list) => { headers = list }
+        Err(error) => { return Err(self._fail(error.kind, error.code)) }
+    }
+    if self.block_stream != self.active || self.remote_closed { return Ok(()) }
+    if self.block_end { self.remote_closed = true }
+    self.events.push(Event.Headers(headers, self.block_end))
+    self._finish_if_closed()
+    return Ok(())
+}
